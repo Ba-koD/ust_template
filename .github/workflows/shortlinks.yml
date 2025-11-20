@@ -1,0 +1,291 @@
+name: Shortlinks
+
+on:
+  push:
+    branches: [ main, master ]
+  issues:
+    types: [ opened, deleted ]
+  issue_comment:
+    types: [ created ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  link-manager:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Process Links
+        uses: actions/github-script@v7
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          SENDER: ${{ github.event.sender.login }}
+          EVENT_NAME: ${{ github.event_name }}
+          ACTION: ${{ github.event.action }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            // --- Configuration ---
+            const DATA_FILE = 'data/links.json';
+            const BANNED_FILE = 'data/banned.json';
+            const REPO_FILE = 'data/repo.json';
+            const DOMAIN_FILE = 'data/domain.json';
+            const BRANCH = 'pages'; // Target branch for data
+            
+            // --- Helpers ---
+            async function checkoutBranch() {
+              try {
+                await exec.exec('git', ['fetch', 'origin', BRANCH]);
+                await exec.exec('git', ['checkout', BRANCH]);
+              } catch (e) {
+                console.log(`Branch ${BRANCH} not found, creating orphan branch.`);
+                await exec.exec('git', ['checkout', '--orphan', BRANCH]);
+                await exec.exec('git', ['rm', '-rf', '.']);
+                // Copy initial data files from main if they don't exist in orphan
+                await exec.exec('git', ['checkout', 'origin/main', '--', 'data', 'index.html', '404.html', 'CNAME']);
+                await exec.exec('git', ['commit', '-m', 'Initial commit on pages branch']);
+              }
+            }
+
+            async function readJson(file) {
+              if (!fs.existsSync(file)) return null;
+              return JSON.parse(fs.readFileSync(file, 'utf8'));
+            }
+
+            async function writeJson(file, data) {
+              fs.mkdirSync(path.dirname(file), { recursive: true });
+              fs.writeFileSync(file, JSON.stringify(data, null, 2));
+            }
+
+            function generateSlug() {
+              const chars = 'abcdefghjkmnpqrstuvwxyz23456789'; // No easily confused chars
+              let slug = '';
+              for (let i = 0; i < 6; i++) {
+                slug += chars.charAt(Math.floor(Math.random() * chars.length));
+              }
+              return slug;
+            }
+
+            // --- Main Logic ---
+            
+            // 1. Handle Push (Metadata Update)
+            if (process.env.EVENT_NAME === 'push') {
+              console.log('Handling Push event...');
+              await checkoutBranch();
+              
+              const repoData = { repo: context.repo.owner + '/' + context.repo.repo };
+              await writeJson(REPO_FILE, repoData);
+              
+              if (fs.existsSync('CNAME')) {
+                const cname = fs.readFileSync('CNAME', 'utf8').trim();
+                await writeJson(DOMAIN_FILE, { domain: cname });
+              }
+              
+              await exec.exec('git', ['add', '.']);
+              try {
+                await exec.exec('git', ['commit', '-m', 'Update metadata from main']);
+                await exec.exec('git', ['push', 'origin', BRANCH]);
+              } catch (e) {
+                console.log('Nothing to commit or push failed');
+              }
+              return;
+            }
+
+            // 2. Handle Issue/Comment
+            const issueNumber = parseInt(process.env.ISSUE_NUMBER);
+            if (!issueNumber) {
+              console.log('No issue number, skipping.');
+              return;
+            }
+
+            const { owner, repo } = context.repo;
+            
+            // Check permissions for approval
+            async function isAuthorized(username) {
+              try {
+                const { data: permission } = await github.rest.repos.getCollaboratorPermissionLevel({
+                  owner, repo, username
+                });
+                return ['admin', 'write', 'maintain'].includes(permission.permission);
+              } catch (e) {
+                return false;
+              }
+            }
+
+            // Parse Issue Body
+            function parseBody(body) {
+              const lines = body.split('\n');
+              let url = '';
+              let slug = '';
+              for (const line of lines) {
+                if (line.trim().startsWith('URL:')) url = line.replace('URL:', '').trim();
+                if (line.trim().startsWith('SLUG:')) slug = line.replace('SLUG:', '').trim();
+              }
+              return { url, slug };
+            }
+
+            // Load Data
+            await checkoutBranch();
+            let linksData = await readJson(DATA_FILE) || { version: 1, links: [] };
+            let bannedData = await readJson(BANNED_FILE) || { version: 1, urls: [], hosts: [] };
+
+            // Handle Deletion
+            if (process.env.EVENT_NAME === 'issues' && process.env.ACTION === 'deleted') {
+              const initialLength = linksData.links.length;
+              linksData.links = linksData.links.filter(l => l.issueNumber !== issueNumber);
+              if (linksData.links.length !== initialLength) {
+                await writeJson(DATA_FILE, linksData);
+                await exec.exec('git', ['add', DATA_FILE]);
+                await exec.exec('git', ['commit', '-m', `Delete link for issue #${issueNumber}`]);
+                await exec.exec('git', ['push', 'origin', BRANCH]);
+              }
+              return;
+            }
+
+            // Handle Creation / Approval
+            let body = process.env.ISSUE_BODY;
+            // If comment, fetch issue body
+            if (process.env.EVENT_NAME === 'issue_comment') {
+               const { data: issue } = await github.rest.issues.get({ owner, repo, issue_number: issueNumber });
+               body = issue.body;
+            }
+
+            const { url, slug: requestedSlug } = parseBody(body || '');
+            
+            if (!url) {
+              console.log('No URL found in issue body.');
+              return;
+            }
+
+            // Check Banned
+            try {
+              const urlObj = new URL(url);
+              if (bannedData.hosts.some(h => urlObj.hostname.includes(h)) || bannedData.urls.includes(url)) {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: issueNumber,
+                  body: `❌ The URL domain or path is banned.`
+                });
+                await github.rest.issues.update({ owner, repo, issue_number: issueNumber, state: 'closed' });
+                return;
+              }
+            } catch (e) {
+               await github.rest.issues.createComment({
+                  owner, repo, issue_number: issueNumber,
+                  body: `❌ Invalid URL format.`
+                });
+                return;
+            }
+
+            let finalSlug = requestedSlug;
+            let isReserved = !!requestedSlug;
+
+            // Logic Flow
+            // 1. Random (No SLUG provided) -> Create immediately
+            // 2. Reserved (SLUG provided) -> Wait for "Approved" comment from maintainer
+
+            if (isReserved) {
+              // Check if this is an approval event
+              if (process.env.EVENT_NAME === 'issue_comment' && process.env.ACTION === 'created') {
+                const commentBody = process.env.COMMENT_BODY.trim().toLowerCase();
+                if (commentBody === 'approved') {
+                  const author = process.env.COMMENT_AUTHOR;
+                  if (!await isAuthorized(author)) {
+                    console.log(`User ${author} not authorized to approve.`);
+                    return;
+                  }
+                  // Proceed to create
+                } else {
+                  console.log('Comment is not "Approved".');
+                  return;
+                }
+              } else {
+                // Issue opened with SLUG -> Acknowledge and wait
+                if (process.env.EVENT_NAME === 'issues' && process.env.ACTION === 'opened') {
+                  await github.rest.issues.createComment({
+                    owner, repo, issue_number: issueNumber,
+                    body: `👋 Reserved slug request detected: \`${requestedSlug}\`. \n\nA maintainer must comment **"Approved"** to create this link.`
+                  });
+                  return;
+                }
+                // Other events ignore
+                return;
+              }
+            } else {
+              // Random slug, only process on open
+              if (process.env.EVENT_NAME !== 'issues' || process.env.ACTION !== 'opened') return;
+              finalSlug = generateSlug();
+              // Ensure unique
+              while (linksData.links.some(l => l.slug === finalSlug)) {
+                finalSlug = generateSlug();
+              }
+            }
+
+            // Check duplicate slug (for reserved)
+            if (linksData.links.some(l => l.slug === finalSlug)) {
+               await github.rest.issues.createComment({
+                  owner, repo, issue_number: issueNumber,
+                  body: `❌ Slug \`${finalSlug}\` is already in use.`
+               });
+               if (!isReserved) await github.rest.issues.update({ owner, repo, issue_number: issueNumber, state: 'closed' });
+               return;
+            }
+
+            // Create Link
+            const newLink = {
+              slug: finalSlug,
+              url: url,
+              reserved: isReserved,
+              createdAt: new Date().toISOString(),
+              createdBy: process.env.SENDER,
+              issueNumber: issueNumber
+            };
+
+            linksData.links.unshift(newLink); // Add to top
+            await writeJson(DATA_FILE, linksData);
+
+            // Commit
+            await exec.exec('git', ['add', DATA_FILE]);
+            await exec.exec('git', ['commit', '-m', `Add shortlink: ${finalSlug}`]);
+            await exec.exec('git', ['push', 'origin', BRANCH]);
+
+            // Comment Result
+            const domain = fs.existsSync(DOMAIN_FILE) ? JSON.parse(fs.readFileSync(DOMAIN_FILE)).domain : `${owner}.github.io/${repo}`;
+            const shortUrl = `https://${domain}/${finalSlug}`;
+            
+            const msg = isReserved 
+              ? `✅ **Approved!**\n\nShort link created: ${shortUrl} \nTarget: ${url}`
+              : `✨ **Created!**\n\nShort link: ${shortUrl} \nTarget: ${url}`;
+
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: issueNumber,
+              body: msg
+            });
+
+            // Close Issue
+            await github.rest.issues.update({ owner, repo, issue_number: issueNumber, state: 'closed' });

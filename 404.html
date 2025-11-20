@@ -1,0 +1,82 @@
+<!doctype html>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Redirecting...</title>
+<style>
+  html, body { height: 100%; margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, Apple Color Emoji, Segoe UI Emoji; }
+  .wrap { display: grid; place-items: center; height: 100%; }
+  .card { text-align: center; line-height: 1.6; color: #222; }
+  .muted { color: #666; font-size: 14px; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+</style>
+<div class="wrap">
+  <div class="card">
+    <div class="muted">Redirecting...</div>
+    <div class="muted mono" id="dbg"></div>
+  </div>
+  
+  <script>
+  (async () => {
+    const debugEl = document.getElementById('dbg');
+    function logToUi(...args) {
+      try { debugEl.textContent = String(args.map(x => typeof x === 'object' ? JSON.stringify(x) : x).join(' ')); } catch (_) {}
+    }
+
+    try {
+      const path = (location.pathname || "/").replace(/^\/+|\/+$/g, "");
+      const ts = Date.now();
+      let repo = '';
+      try {
+        const rr = await fetch(`/data/repo.json?ts=${ts}`, { cache: 'no-store' });
+        if (rr.ok) {
+          const meta = await rr.json();
+          repo = String(meta.repo || '');
+        }
+      } catch (_) {}
+      const baseUrl = repo && /.+\/.+/.test(repo)
+        ? `https://raw.githubusercontent.com/${repo}/pages/data/links.json`
+        : `/data/links.json`;
+      const res = await fetch(`${baseUrl}?ts=${ts}`, { cache: "no-store" });
+      if (!res.ok) throw new Error("Failed to load links.json");
+      const data = await res.json();
+
+      console.log("[redirect] pathname:", path, "linksCount:", Array.isArray(data.links) ? data.links.length : 0);
+      logToUi("path=", path);
+
+      const records = Array.isArray(data.links) ? data.links : [];
+      const dest = (() => {
+        for (let i = 0; i < records.length; i++) {
+          const s = String(records[i].slug || "");
+          if (s === path) return String(records[i].url || "");
+        }
+        return "";
+      })();
+
+      if (dest) {
+        console.log("[redirect] match found:", dest);
+        location.replace(dest);
+        return;
+      }
+
+      const qsSlug = new URLSearchParams(location.search).get("to");
+      if (qsSlug) {
+        const found = records.find(r => String(r.slug) === String(qsSlug));
+        if (found && found.url) {
+          console.log("[redirect] query match:", qsSlug, "->", found.url);
+          location.replace(String(found.url));
+          return;
+        }
+      }
+
+      document.title = "Not Found";
+      document.querySelector('.muted').textContent = "Not Found";
+      logToUi("no match");
+    } catch (err) {
+      console.error("[redirect] error:", err);
+      document.title = "Error";
+      document.querySelector('.muted').textContent = "Error";
+      logToUi("error");
+    }
+  })();
+  </script>
+</div>
