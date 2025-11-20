@@ -1,0 +1,213 @@
+<!doctype html>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>URL Shortener</title>
+<style>
+  html, body { height: 100%; margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, Apple Color Emoji, Segoe UI Emoji; }
+  .wrap { display: grid; place-items: center; height: 100%; padding: 24px; }
+  .card { max-width: 720px; width: 100%; }
+  h1 { margin: 0 0 12px; font-size: 24px; }
+  p { margin: 8px 0; line-height: 1.7; color: #222; }
+  .muted { color: #666; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+  code { background: #f4f4f5; padding: 2px 6px; border-radius: 4px; }
+  .stat { margin-top: 16px; padding: 12px; background: #f8fafc; border: 1px solid #e5e7eb; border-radius: 8px; }
+  .logs { margin-top: 12px; font-size: 12px; color: #475569; }
+  .hr { height: 1px; background: #e5e7eb; margin: 16px 0; }
+  .form { margin-top: 16px; padding: 12px; background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; }
+  .row { display: grid; grid-template-columns: 120px 1fr; gap: 8px; align-items: center; margin: 8px 0; }
+  input[type="text"] { width: 100%; padding: 10px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; }
+  button { appearance: none; padding: 10px 14px; border: 1px solid #d1d5db; background: #111827; color: #fff; border-radius: 6px; cursor: pointer; font-size: 14px; }
+  button:disabled { opacity: .6; cursor: not-allowed; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+  .out { margin-top: 12px; padding: 10px; background: #f8fafc; border: 1px solid #e5e7eb; border-radius: 6px; display: none; align-items: center; justify-content: space-between; gap: 8px; }
+  .ok { color: #16a34a; font-weight: 600; }
+  .err { color: #dc2626; font-weight: 600; }
+  .list { margin-top: 16px; padding: 12px; background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 8px; }
+  .item { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; padding: 8px 0; border-bottom: 1px dashed #e5e7eb; }
+  .item:last-child { border-bottom: 0; }
+  .pin { background:#fffbe6; }
+  .list-title { margin: 0 0 8px; font-weight: 600; font-size: 14px; color:#334155; }
+</style>
+<div class="wrap">
+  <div class="card">
+    <h1>URL Shortener</h1>
+    <p class="muted">GitHub Pages + Actions based short link service for <span class="mono" id="domain-host"></span>.</p>
+
+    <div class="stat">
+      <div>Total links: <span id="count" class="mono">0</span></div>
+      <div class="logs mono" id="logs"></div>
+    </div>
+
+    <div class="hr"></div>
+    <div class="form">
+      <div class="row">
+        <label class="mono">Create via Issue</label>
+        <div class="actions">
+          <a id="lnk-random" target="_blank" rel="noopener noreferrer" style="text-decoration:none;"><button type="button">New random shortlink issue</button></a>
+          <a id="lnk-reserved" target="_blank" rel="noopener noreferrer" style="text-decoration:none;"><button type="button">Request reserved slug</button></a>
+        </div>
+      </div>
+      <div class="logs mono" id="logs-ui"></div>
+    </div>
+    <p>
+      This page shows status only. To create:
+      - Random: open issue and set body to <code>URL: https://example.com</code>
+      - Reserved: add <code>SLUG: your-slug</code> (requires approval)
+    </p>
+    <p class="muted">Example: <code id="example-short"></code> → <code>https://example.com</code></p>
+  </div>
+</div>
+
+<script>
+window.applyAndRender = window.applyAndRender || function(){};
+(async () => {
+  const logs = document.getElementById('logs');
+  function log(s) { try { logs.textContent = String(s); } catch (_) {} }
+
+  try {
+    const ts = Date.now();
+    const resRepo = await fetch(`/data/repo.json?ts=${ts}`, { cache: 'no-store' });
+    if (resRepo.ok) {
+      const meta = await resRepo.json();
+      window.__REPO_FULL__ = String(meta.repo || '');
+      console.log('[index] repo:', window.__REPO_FULL__);
+      const repo = window.__REPO_FULL__;
+      if (repo && /.+\/.+/.test(repo)) {
+        const randomA = document.getElementById('lnk-random');
+        if (randomA) {
+          const title = '[shortlink] request';
+          const body = 'URL: ';
+          const issueUrl = `https://github.com/${repo}/issues/new?title=${encodeURIComponent(title)}&body=${encodeURIComponent(body)}`;
+          randomA.href = issueUrl;
+          console.log('[index] random issue link:', issueUrl);
+        }
+        const reservedA = document.getElementById('lnk-reserved');
+        if (reservedA) {
+          const tplUrl = `https://github.com/${repo}/issues/new?template=pin-slug.md`;
+          reservedA.href = tplUrl;
+          console.log('[index] reserved template link:', tplUrl);
+        }
+      }
+    } else {
+      window.__REPO_FULL__ = '';
+    }
+
+    const resDomain = await fetch(`/data/domain.json?ts=${ts}`, { cache: 'no-store' });
+    if (resDomain.ok) {
+      const d = await resDomain.json();
+      const host = String(d.domain || location.hostname);
+      document.getElementById('domain-host').textContent = host;
+      document.getElementById('example-short').textContent = `https://${host}/hello`;
+      window.__HOST__ = host;
+    }
+
+    const repoFull = String(window.__REPO_FULL__ || '');
+    const rawBase = repoFull ? `https://raw.githubusercontent.com/${repoFull}/pages/data` : '/data';
+
+    const res = await fetch(`${rawBase}/links.json?ts=${ts}`, { cache: 'no-store' });
+    if (!res.ok) throw new Error('Failed to load links.json');
+    const data = await res.json();
+    const items = Array.isArray(data.links) ? data.links.filter(e => e && e.slug && e.url) : [];
+    const count = items.length;
+    document.getElementById('count').textContent = String(count);
+    console.log('[index] linksCount:', count, 'from:', rawBase);
+    window.__ALL_LINKS__ = items;
+    if (typeof window.applyAndRender === 'function') {
+      window.applyAndRender();
+    }
+    window.__LINKS__ = items;
+
+    try {
+      const resBan = await fetch(`${rawBase}/banned.json?ts=${ts}`, { cache: 'no-store' });
+      if (resBan.ok) {
+        const ban = await resBan.json();
+        window.__BANNED_URLS__ = Array.isArray(ban.urls) ? ban.urls : [];
+        window.__BANNED_HOSTS__ = Array.isArray(ban.hosts) ? ban.hosts : [];
+      }
+    } catch (_) {}
+  } catch (e) {
+    log('error loading data');
+    console.error('[index] error:', e);
+  }
+})();
+
+  window.applyAndRender = function applyAndRender() {
+    try {
+      const all = Array.isArray(window.__ALL_LINKS__) ? window.__ALL_LINKS__ : [];
+      const pinned = all.filter(e => e.reserved);
+      const normal = all.filter(e => !e.reserved)
+        .sort((a,b)=> new Date(b.createdAt||0) - new Date(a.createdAt||0));
+      let root = document.querySelector('.list');
+      if (!root) { root = document.createElement('div'); root.className = 'list'; document.querySelector('.card').appendChild(root); }
+      root.innerHTML = '';
+      const pinnedTitle = document.createElement('div'); pinnedTitle.className='list-title'; pinnedTitle.textContent='Reserved (pinned)'; root.appendChild(pinnedTitle);
+      const base = (window.__HOST__ ? `https://${window.__HOST__}` : location.origin).replace(/\/$/, '');
+      const buildItem = (e, pinnedFlag) => {
+        const item = document.createElement('div');
+        item.className = 'item' + (pinnedFlag ? ' pin' : '');
+        const left = document.createElement('div');
+        left.innerHTML = `<a class="mono" href="${base}/${e.slug}" target="_blank" rel="noopener noreferrer">${base}/${e.slug}</a> → <a class="mono" href="${e.url}" target="_blank" rel="noopener noreferrer">${e.url}</a>` + (e.createdAt? ` <span class="muted">(${new Date(e.createdAt).toLocaleString()})</span>`:'');
+        const right = document.createElement('div');
+        const btn = document.createElement('button');
+        btn.textContent = 'Copy';
+        btn.addEventListener('click', async () => {
+          try { await navigator.clipboard.writeText(`${base}/${e.slug}`); btn.textContent = 'Copied'; setTimeout(()=>{btn.textContent='Copy';},1200);} catch(err){ console.error('[list] copy error:', err); }
+        });
+        right.appendChild(btn);
+        item.appendChild(left);
+        item.appendChild(right);
+        root.appendChild(item);
+      };
+      pinned.forEach(e => buildItem(e, true));
+      const normalTitle = document.createElement('div'); normalTitle.className='list-title'; normalTitle.textContent='Automatic (latest first)'; root.appendChild(normalTitle);
+      normal.forEach(e => buildItem(e, false));
+    } catch (err) {
+      console.error('[sort] render error:', err);
+    }
+  }
+
+function renderList(records) {
+  try {
+    const root = document.querySelector('.card');
+    const wrap = document.createElement('div');
+    wrap.className = 'list';
+    const title = document.createElement('div');
+    title.innerHTML = '<strong>Current redirects</strong>';
+    wrap.appendChild(title);
+
+    const base = (window.__HOST__ ? `https://${window.__HOST__}` : location.origin).replace(/\/$/, '');
+    for (let i = 0; i < records.length; i++) {
+      const e = records[i];
+      const slug = String(e.slug || '');
+      const dest = String(e.url || '');
+      if (!slug || !dest) continue;
+
+      const item = document.createElement('div');
+      item.className = 'item';
+      const left = document.createElement('div');
+      left.innerHTML = `<a class="mono" href="${base}/${slug}" target="_blank" rel="noopener noreferrer">${base}/${slug}</a> → <a class="mono" href="${dest}" target="_blank" rel="noopener noreferrer">${dest}</a>`;
+      const right = document.createElement('div');
+      const btn = document.createElement('button');
+      btn.textContent = 'Copy';
+      btn.addEventListener('click', async () => {
+        try {
+          await navigator.clipboard.writeText(`${base}/${slug}`);
+          btn.textContent = 'Copied';
+          setTimeout(() => { btn.textContent = 'Copy'; }, 1200);
+        } catch (err) {
+          console.error('[list] copy error:', err);
+        }
+      });
+      right.appendChild(btn);
+      item.appendChild(left);
+      item.appendChild(right);
+      wrap.appendChild(item);
+    }
+
+    root.appendChild(wrap);
+  } catch (err) {
+    console.error('[list] render error:', err);
+  }
+}
+</script>
