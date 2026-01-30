@@ -4,7 +4,7 @@ on:
   push:
     branches: [ main, master ]
   issues:
-    types: [ opened, deleted ]
+    types: [ opened, deleted, closed ]
   issue_comment:
     types: [ created ]
   workflow_dispatch:
@@ -210,7 +210,12 @@ jobs:
             // 2. Reserved (SLUG provided) -> Wait for "Approved" comment from maintainer
 
             if (isReserved) {
-              // Check if this is an approval event
+              // Get domain for URL display
+              const domainData = await readJson(DOMAIN_FILE);
+              const previewDomain = (domainData && domainData.domain) ? domainData.domain : `${owner}.github.io/${repo}`;
+              const previewUrl = `https://${previewDomain}/${requestedSlug}`;
+              
+              // Check if this is an approval event (comment "Approved" or issue closed as completed)
               if (process.env.EVENT_NAME === 'issue_comment' && process.env.ACTION === 'created') {
                 const commentBody = process.env.COMMENT_BODY.trim().toLowerCase();
                 if (commentBody === 'approved') {
@@ -224,12 +229,38 @@ jobs:
                   console.log('Comment is not "Approved".');
                   return;
                 }
+              } else if (process.env.EVENT_NAME === 'issues' && process.env.ACTION === 'closed') {
+                // Handle issue closed events
+                const { data: issue } = await github.rest.issues.get({ owner, repo, issue_number: issueNumber });
+                const stateReason = issue.state_reason;
+                
+                console.log(`Issue closed with state_reason: ${stateReason}`);
+                
+                if (stateReason === 'not_planned') {
+                  // Rejected - close as not planned
+                  await github.rest.issues.createComment({
+                    owner, repo, issue_number: issueNumber,
+                    body: `❌ **Rejected**\n\nThe reserved slug request for \`${requestedSlug}\` (${previewUrl}) has been rejected.`
+                  });
+                  return;
+                } else if (stateReason === 'completed') {
+                  // Check if already processed (link exists)
+                  if (linksData.links.some(l => l.issueNumber === issueNumber)) {
+                    console.log('Link already exists for this issue, skipping.');
+                    return;
+                  }
+                  // Approved via "Close as completed" - proceed to create
+                  console.log('Approved via Close as completed');
+                } else {
+                  console.log(`Unknown state_reason: ${stateReason}, skipping.`);
+                  return;
+                }
               } else {
                 // Issue opened with SLUG -> Acknowledge and wait
                 if (process.env.EVENT_NAME === 'issues' && process.env.ACTION === 'opened') {
                   await github.rest.issues.createComment({
                     owner, repo, issue_number: issueNumber,
-                    body: `👋 Reserved slug request detected: \`${requestedSlug}\`. \n\nA maintainer must comment **"Approved"** to create this link.`
+                    body: `👋 Reserved slug request detected: [${previewUrl}](${previewUrl})\n\nTo approve this link, a maintainer can:\n- Comment **"Approved"**\n- Or close this issue as **"Close as completed"**\n\nTo reject, close as **"Close as not planned"**.`
                   });
                   return;
                 }
@@ -275,7 +306,8 @@ jobs:
             await exec.exec('git', ['push', 'origin', BRANCH]);
 
             // Comment Result
-            const domain = fs.existsSync(DOMAIN_FILE) ? JSON.parse(fs.readFileSync(DOMAIN_FILE)).domain : `${owner}.github.io/${repo}`;
+            const domainJson = fs.existsSync(DOMAIN_FILE) ? JSON.parse(fs.readFileSync(DOMAIN_FILE)) : null;
+            const domain = (domainJson && domainJson.domain) ? domainJson.domain : `${owner}.github.io/${repo}`;
             const shortUrl = `https://${domain}/${finalSlug}`;
             
             const msg = isReserved 
