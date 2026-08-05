@@ -46,6 +46,8 @@
         <div class="actions">
           <a id="lnk-random" target="_blank" rel="noopener noreferrer" style="text-decoration:none;"><button type="button">New random shortlink issue</button></a>
           <a id="lnk-reserved" target="_blank" rel="noopener noreferrer" style="text-decoration:none;"><button type="button">Request reserved slug</button></a>
+          <a id="lnk-edit" target="_blank" rel="noopener noreferrer" style="text-decoration:none;"><button type="button">Request edit</button></a>
+          <a id="lnk-delete" target="_blank" rel="noopener noreferrer" style="text-decoration:none;"><button type="button">Request delete</button></a>
         </div>
       </div>
       <div class="logs mono" id="logs-ui"></div>
@@ -54,6 +56,8 @@
       This page shows status only. To create:
       - Random: open issue and set body to <code>URL: https://example.com</code>
       - Reserved: add <code>SLUG: your-slug</code> (requires approval)
+      - Edit: <code>EDIT: your-slug</code> + <code>URL: new-target</code> (requires approval)
+      - Delete: <code>DELETE: your-slug</code> (requires approval)
     </p>
     <p class="muted">Example: <code id="example-short"></code> → <code>https://example.com</code></p>
   </div>
@@ -88,6 +92,10 @@ window.applyAndRender = window.applyAndRender || function(){};
           reservedA.href = tplUrl;
           console.log('[index] reserved template link:', tplUrl);
         }
+        const editA = document.getElementById('lnk-edit');
+        if (editA) editA.href = `https://github.com/${repo}/issues/new?template=edit-slug.md`;
+        const deleteA = document.getElementById('lnk-delete');
+        if (deleteA) deleteA.href = `https://github.com/${repo}/issues/new?template=delete-slug.md`;
       }
     } else {
       window.__REPO_FULL__ = '';

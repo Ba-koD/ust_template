@@ -8,7 +8,9 @@ URL shortener powered by GitHub Pages + GitHub Actions. No servers, no DB to run
 - UI (`index.html`): status-only page that lists links and provides issue shortcuts:
   - New random shortlink issue (body prefilled with `URL:`)
   - Request reserved slug (issue template, fill `URL:` + `SLUG:`)
-- Approval: reserved slugs require a maintainer to comment "Approved" (case-insensitive). Only users with `admin`, `write`, or `maintain` are accepted.
+  - Request edit (issue template, fill `EDIT:` + `URL:`)
+  - Request delete (issue template, fill `DELETE:`)
+- Approval: reserved/edit/delete requests require a maintainer to comment "Approved" (case-insensitive) or close the issue as "completed". Only users with `admin`, `write`, or `maintain` are accepted. Requests opened by a maintainer are auto-approved.
 - Metadata: `data/repo.json` and `data/domain.json` are auto-populated by workflows.
 
 ## Setup
@@ -30,17 +32,40 @@ URL shortener powered by GitHub Pages + GitHub Actions. No servers, no DB to run
   - `Created shortlink: https://your.domain/slug → https://example.com/path`
 - The issue is then closed.
 
-### Reserved (requires approval comment)
+### Reserved (requires approval)
 - Click "Request reserved slug" (issue template), and include two fields:
   ```text
   URL: https://example.com/path
   SLUG: your-slug
   ```
-- The workflow detects `SLUG:` and switches to reserved mode. It posts an acknowledgement comment and waits.
-- A maintainer (permission: `admin`/`write`/`maintain`) comments `Approved`.
-- The workflow verifies permission, creates the link, and comments back the result as a clickable short URL:
-  - `Approved by @user. Created: https://your.domain/your-slug → https://example.com/path`
-- The issue is then closed.
+- The workflow detects `SLUG:` and switches to reserved mode.
+- On open it validates immediately: invalid slug format, banned/invalid URL, or an already-taken slug gets an explanatory comment and the issue is closed as "not planned".
+- If the requester is a maintainer, the link is created right away (auto-approved).
+- Otherwise it posts an acknowledgement comment and waits. A maintainer (permission: `admin`/`write`/`maintain`) then either:
+  - comments `Approved`, or
+  - closes the issue as **"Close as completed"**.
+- To reject, close the issue as **"Close as not planned"**.
+- The workflow verifies permission, creates the link, comments back the clickable short URL, and closes the issue.
+
+## Edit links (via Issues)
+- Click "Request edit" (issue template), and include two fields:
+  ```text
+  EDIT: your-slug
+  URL: https://example.com/new-path
+  ```
+- On open it validates: the slug must exist and the new URL must be valid and not banned.
+- Maintainer requests are auto-approved; others need a maintainer `Approved` comment or "Close as completed".
+- On approval the link's target URL is updated (`updatedAt`/`updatedBy` recorded) and the result is commented back.
+
+## Delete links (via Issues)
+- Click "Request delete" (issue template), and include one field:
+  ```text
+  DELETE: your-slug
+  ```
+- On open it validates that the slug exists.
+- Maintainer requests are auto-approved; others need a maintainer `Approved` comment or "Close as completed".
+- On approval the link is removed from `data/links.json`.
+- Deleting the original GitHub issue that created a link also removes that link (maintainers only, via GitHub's issue delete).
 
 ## Lists and ordering
 - The UI renders two sections from `data/links.json`:
@@ -55,10 +80,10 @@ URL shortener powered by GitHub Pages + GitHub Actions. No servers, no DB to run
 - File: `.github/workflows/shortlinks.yml`
 - Triggers
   - `push` on `main` or `master`: write repo/domain metadata to `pages`
-  - `issues.opened`: create links (random or reserved-awaiting-approval)
-  - `issue_comment.created`: on "Approved" from an authorized user, create reserved link
+  - `issues.opened`: handle requests (random / reserved / edit / delete)
+  - `issue_comment.created`: on "Approved" from an authorized user, apply the pending request
+  - `issues.closed`: "Close as completed" approves (authorized users only — others are reopened), "Close as not planned" rejects
   - `issues.deleted`: remove any link whose `issueNumber` matches the deleted issue
-  - `pull_request`: validate changes to `data/links.json`
   - `workflow_dispatch`: optional manual run for maintenance
 - Git operations: all commits target `pages`. Pushes use fetch + rebase + retry to avoid non-fast-forward errors.
 - Node execution: Node code is executed via heredoc under CommonJS and wrapped in an async IIFE for compatibility.
@@ -93,9 +118,11 @@ URL shortener powered by GitHub Pages + GitHub Actions. No servers, no DB to run
 
 ## Validation & guardrails
 - Banned URLs/hosts: defined in `data/banned.json`; both UI (pre-check) and workflows enforce it.
-- Duplicate destination URL: disallowed.
+- Duplicate destination URL (random links): instead of creating a duplicate, the existing short link is returned.
+- Already-taken slug: rejected immediately when the request is opened (with the current target shown).
 - Slug format: `^[A-Za-z0-9-_]+$`.
-- Permission check for approvals: only `admin`, `write`, or `maintain` can approve reserved links.
+- Permission check for approvals: only `admin`, `write`, or `maintain` can approve (comment or close-as-completed). Unauthorized "Close as completed" attempts are reopened automatically.
+- Short-URL domain in comments: resolved from `data/domain.json`, falling back to `CNAME`, then `OWNER.github.io/REPO`.
 
 ## Troubleshooting
 - New link not visible: wait for Pages redeploy (typically 30–90s) and hard refresh.

@@ -41,6 +41,8 @@ jobs:
         env:
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           ISSUE_BODY: ${{ github.event.issue.body }}
+          ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
+          STATE_REASON: ${{ github.event.issue.state_reason }}
           COMMENT_BODY: ${{ github.event.comment.body }}
           COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
           SENDER: ${{ github.event.sender.login }}
@@ -57,7 +59,10 @@ jobs:
             const REPO_FILE = 'data/repo.json';
             const DOMAIN_FILE = 'data/domain.json';
             const BRANCH = 'pages'; // Target branch for data
-            
+            const SLUG_RE = /^[A-Za-z0-9-_]+$/;
+
+            const { owner, repo } = context.repo;
+
             // --- Helpers ---
             async function checkoutBranch() {
               try {
@@ -73,12 +78,12 @@ jobs:
               }
             }
 
-            async function readJson(file) {
+            function readJson(file) {
               if (!fs.existsSync(file)) return null;
               return JSON.parse(fs.readFileSync(file, 'utf8'));
             }
 
-            async function writeJson(file, data) {
+            function writeJson(file, data) {
               fs.mkdirSync(path.dirname(file), { recursive: true });
               fs.writeFileSync(file, JSON.stringify(data, null, 2));
             }
@@ -92,21 +97,56 @@ jobs:
               return slug;
             }
 
+            // domain.json -> CNAME -> owner.github.io/repo (must be called after checkoutBranch)
+            function getDomain() {
+              try {
+                const d = readJson(DOMAIN_FILE);
+                if (d && d.domain) return d.domain;
+              } catch (e) {}
+              try {
+                const cname = fs.readFileSync('CNAME', 'utf8').trim();
+                if (cname) return cname;
+              } catch (e) {}
+              return `${owner}.github.io/${repo}`;
+            }
+
+            function shortUrlOf(slug) {
+              return `https://${getDomain()}/${slug}`;
+            }
+
+            async function commitAndPush(message) {
+              await exec.exec('git', ['add', DATA_FILE]);
+              await exec.exec('git', ['commit', '-m', message]);
+              for (let i = 0; i < 3; i++) {
+                try {
+                  await exec.exec('git', ['push', 'origin', BRANCH]);
+                  return;
+                } catch (e) {
+                  await exec.exec('git', ['pull', '--rebase', 'origin', BRANCH]);
+                }
+              }
+              throw new Error('Failed to push after retries');
+            }
+
             // --- Main Logic ---
-            
+
             // 1. Handle Push (Metadata Update)
             if (process.env.EVENT_NAME === 'push') {
               console.log('Handling Push event...');
               await checkoutBranch();
-              
-              const repoData = { repo: context.repo.owner + '/' + context.repo.repo };
-              await writeJson(REPO_FILE, repoData);
-              
+
+              const repoData = { repo: owner + '/' + repo };
+              writeJson(REPO_FILE, repoData);
+
               if (fs.existsSync('CNAME')) {
                 const cname = fs.readFileSync('CNAME', 'utf8').trim();
-                await writeJson(DOMAIN_FILE, { domain: cname });
+                const existing = readJson(DOMAIN_FILE);
+                // Never overwrite a set domain with an empty CNAME
+                if (cname || !(existing && existing.domain)) {
+                  writeJson(DOMAIN_FILE, { domain: cname });
+                }
               }
-              
+
               await exec.exec('git', ['add', '.']);
               try {
                 await exec.exec('git', ['commit', '-m', 'Update metadata from main']);
@@ -124,10 +164,8 @@ jobs:
               return;
             }
 
-            const { owner, repo } = context.repo;
-            
-            // Check permissions for approval
             async function isAuthorized(username) {
+              if (!username) return false;
               try {
                 const { data: permission } = await github.rest.repos.getCollaboratorPermissionLevel({
                   owner, repo, username
@@ -138,186 +176,390 @@ jobs:
               }
             }
 
+            async function comment(body) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: issueNumber, body });
+            }
+
+            async function closeIssue(reason) {
+              await github.rest.issues.update({
+                owner, repo, issue_number: issueNumber,
+                state: 'closed', state_reason: reason || 'completed'
+              });
+            }
+
+            async function reopenIssue() {
+              await github.rest.issues.update({ owner, repo, issue_number: issueNumber, state: 'open' });
+            }
+
             // Parse Issue Body
+            // Fields: URL:, SLUG:, DELETE:, EDIT:
             function parseBody(body) {
-              const lines = body.split('\n');
-              let url = '';
-              let slug = '';
-              for (const line of lines) {
-                if (line.trim().startsWith('URL:')) url = line.replace('URL:', '').trim();
-                if (line.trim().startsWith('SLUG:')) slug = line.replace('SLUG:', '').trim();
+              let url = '', slug = '', del = '', edit = '';
+              for (const raw of (body || '').split('\n')) {
+                const line = raw.trim();
+                const upper = line.toUpperCase();
+                if (upper.startsWith('URL:')) url = line.slice(4).trim();
+                else if (upper.startsWith('SLUG:')) slug = line.slice(5).trim();
+                else if (upper.startsWith('DELETE:')) del = line.slice(7).trim();
+                else if (upper.startsWith('EDIT:')) edit = line.slice(5).trim();
               }
-              return { url, slug };
+              return { url, slug, del, edit };
             }
 
             // Load Data
             await checkoutBranch();
-            let linksData = await readJson(DATA_FILE) || { version: 1, links: [] };
-            let bannedData = await readJson(BANNED_FILE) || { version: 1, urls: [], hosts: [] };
+            let linksData = readJson(DATA_FILE) || { version: 1, links: [] };
+            let bannedData = readJson(BANNED_FILE) || { version: 1, urls: [], hosts: [] };
 
-            // Handle Deletion
+            // Handle GitHub issue deletion -> remove matching link
             if (process.env.EVENT_NAME === 'issues' && process.env.ACTION === 'deleted') {
               const initialLength = linksData.links.length;
               linksData.links = linksData.links.filter(l => l.issueNumber !== issueNumber);
               if (linksData.links.length !== initialLength) {
-                await writeJson(DATA_FILE, linksData);
-                await exec.exec('git', ['add', DATA_FILE]);
-                await exec.exec('git', ['commit', '-m', `Delete link for issue #${issueNumber}`]);
-                await exec.exec('git', ['push', 'origin', BRANCH]);
+                writeJson(DATA_FILE, linksData);
+                await commitAndPush(`Delete link for issue #${issueNumber}`);
               }
               return;
             }
 
-            // Handle Creation / Approval
+            // Get issue body (fetch when the event payload may be stale)
             let body = process.env.ISSUE_BODY;
-            // If comment, fetch issue body
             if (process.env.EVENT_NAME === 'issue_comment') {
-               const { data: issue } = await github.rest.issues.get({ owner, repo, issue_number: issueNumber });
-               body = issue.body;
+              const { data: issue } = await github.rest.issues.get({ owner, repo, issue_number: issueNumber });
+              body = issue.body;
             }
 
-            const { url, slug: requestedSlug } = parseBody(body || '');
-            
-            if (!url) {
-              console.log('No URL found in issue body.');
-              return;
+            const { url, slug: requestedSlug, del: deleteSlug, edit: editSlug } = parseBody(body || '');
+
+            // Request type
+            const type = deleteSlug ? 'delete'
+              : editSlug ? 'edit'
+              : requestedSlug ? 'reserved'
+              : url ? 'random'
+              : '';
+
+            // 'invalid' -> null (banned) or 'invalid' string reason
+            function urlProblem(u) {
+              try {
+                const urlObj = new URL(u);
+                if (bannedData.hosts.some(h => urlObj.hostname.includes(h)) || bannedData.urls.includes(u)) {
+                  return 'banned';
+                }
+                return '';
+              } catch (e) {
+                return 'invalid';
+              }
             }
 
-            // Check Banned
-            try {
-              const urlObj = new URL(url);
-              if (bannedData.hosts.some(h => urlObj.hostname.includes(h)) || bannedData.urls.includes(url)) {
-                await github.rest.issues.createComment({
-                  owner, repo, issue_number: issueNumber,
-                  body: `❌ The URL domain or path is banned.`
-                });
-                await github.rest.issues.update({ owner, repo, issue_number: issueNumber, state: 'closed' });
+            // Determine mode: request (issue opened) / approve / reject
+            let mode = '';
+            let approver = '';
+            if (process.env.EVENT_NAME === 'issues' && process.env.ACTION === 'opened') {
+              mode = 'request';
+            } else if (process.env.EVENT_NAME === 'issue_comment' && process.env.ACTION === 'created') {
+              const c = (process.env.COMMENT_BODY || '').trim().toLowerCase();
+              if (!/^approved?$/.test(c)) {
+                console.log('Comment is not an approval.');
                 return;
               }
-            } catch (e) {
-               await github.rest.issues.createComment({
-                  owner, repo, issue_number: issueNumber,
-                  body: `❌ Invalid URL format.`
-                });
+              approver = process.env.COMMENT_AUTHOR;
+              if (!await isAuthorized(approver)) {
+                console.log(`User ${approver} not authorized to approve.`);
                 return;
-            }
-
-            let finalSlug = requestedSlug;
-            let isReserved = !!requestedSlug;
-
-            // Logic Flow
-            // 1. Random (No SLUG provided) -> Create immediately
-            // 2. Reserved (SLUG provided) -> Wait for "Approved" comment from maintainer
-
-            if (isReserved) {
-              // Get domain for URL display
-              const domainData = await readJson(DOMAIN_FILE);
-              const previewDomain = (domainData && domainData.domain) ? domainData.domain : `${owner}.github.io/${repo}`;
-              const previewUrl = `https://${previewDomain}/${requestedSlug}`;
-              
-              // Check if this is an approval event (comment "Approved" or issue closed as completed)
-              if (process.env.EVENT_NAME === 'issue_comment' && process.env.ACTION === 'created') {
-                const commentBody = process.env.COMMENT_BODY.trim().toLowerCase();
-                if (commentBody === 'approved') {
-                  const author = process.env.COMMENT_AUTHOR;
-                  if (!await isAuthorized(author)) {
-                    console.log(`User ${author} not authorized to approve.`);
-                    return;
-                  }
-                  // Proceed to create
-                } else {
-                  console.log('Comment is not "Approved".');
-                  return;
-                }
-              } else if (process.env.EVENT_NAME === 'issues' && process.env.ACTION === 'closed') {
-                // Handle issue closed events
-                const { data: issue } = await github.rest.issues.get({ owner, repo, issue_number: issueNumber });
-                const stateReason = issue.state_reason;
-                
-                console.log(`Issue closed with state_reason: ${stateReason}`);
-                
-                if (stateReason === 'not_planned') {
-                  // Rejected - close as not planned
-                  await github.rest.issues.createComment({
-                    owner, repo, issue_number: issueNumber,
-                    body: `❌ **Rejected**\n\nThe reserved slug request for \`${requestedSlug}\` (${previewUrl}) has been rejected.`
-                  });
-                  return;
-                } else if (stateReason === 'completed') {
-                  // Check if already processed (link exists)
-                  if (linksData.links.some(l => l.issueNumber === issueNumber)) {
-                    console.log('Link already exists for this issue, skipping.');
-                    return;
-                  }
-                  // Approved via "Close as completed" - proceed to create
-                  console.log('Approved via Close as completed');
-                } else {
-                  console.log(`Unknown state_reason: ${stateReason}, skipping.`);
-                  return;
-                }
+              }
+              mode = 'approve';
+            } else if (process.env.EVENT_NAME === 'issues' && process.env.ACTION === 'closed') {
+              const reason = process.env.STATE_REASON;
+              console.log(`Issue closed with state_reason: ${reason}`);
+              if ((process.env.SENDER || '').endsWith('[bot]')) {
+                console.log('Closed by bot (already processed), skipping.');
+                return;
+              }
+              if (reason === 'not_planned') {
+                mode = 'reject';
+              } else if (reason === 'completed') {
+                mode = 'approve';
+                approver = process.env.SENDER;
               } else {
-                // Issue opened with SLUG -> Acknowledge and wait
-                if (process.env.EVENT_NAME === 'issues' && process.env.ACTION === 'opened') {
-                  await github.rest.issues.createComment({
-                    owner, repo, issue_number: issueNumber,
-                    body: `👋 Reserved slug request detected: [${previewUrl}](${previewUrl})\n\nTo approve this link, a maintainer can:\n- Comment **"Approved"**\n- Or close this issue as **"Close as completed"**\n\nTo reject, close as **"Close as not planned"**.`
-                  });
-                  return;
-                }
-                // Other events ignore
                 return;
               }
             } else {
-              // Random slug, only process on open
-              if (process.env.EVENT_NAME !== 'issues' || process.env.ACTION !== 'opened') return;
-              finalSlug = generateSlug();
-              // Ensure unique
+              return;
+            }
+
+            if (!type) {
+              if (mode === 'request') {
+                await comment([
+                  '❌ Could not find any valid request fields in the issue body.',
+                  '',
+                  'Supported formats:',
+                  '- Random shortlink: `URL: https://example.com`',
+                  '- Reserved slug: `URL: https://example.com` + `SLUG: my-slug`',
+                  '- Edit link: `EDIT: my-slug` + `URL: https://new-target.com`',
+                  '- Delete link: `DELETE: my-slug`'
+                ].join('\n'));
+                await closeIssue('not_planned');
+              }
+              return;
+            }
+
+            // For closed-as-completed approvals: verify the closer is authorized.
+            // Idempotence guards run first inside each handler (the bot itself closes
+            // issues after processing, which re-triggers the closed event).
+            async function verifyCloserAuthorized(alreadyDone) {
+              if (alreadyDone) return false; // nothing to do, silent
+              if (process.env.EVENT_NAME === 'issues' && process.env.ACTION === 'closed') {
+                if (!await isAuthorized(approver)) {
+                  await comment(`⚠️ Only maintainers can approve by closing as completed. Reopening.`);
+                  await reopenIssue();
+                  return false;
+                }
+              }
+              return true;
+            }
+
+            const findLink = (slug) => linksData.links.find(l => l.slug === slug);
+
+            // ============ RANDOM ============
+            if (type === 'random') {
+              if (mode !== 'request') return; // random links are only processed on open
+
+              const problem = urlProblem(url);
+              if (problem) {
+                await comment(problem === 'banned' ? '❌ The URL domain or path is banned.' : '❌ Invalid URL format.');
+                await closeIssue('not_planned');
+                return;
+              }
+
+              // Duplicate destination -> return the existing shortlink instead
+              const dup = linksData.links.find(l => !l.reserved && l.url === url);
+              if (dup) {
+                await comment(`ℹ️ A shortlink for this URL already exists: ${shortUrlOf(dup.slug)} \nTarget: ${dup.url}`);
+                await closeIssue();
+                return;
+              }
+
+              let finalSlug = generateSlug();
               while (linksData.links.some(l => l.slug === finalSlug)) {
                 finalSlug = generateSlug();
               }
+
+              linksData.links.unshift({
+                slug: finalSlug,
+                url,
+                reserved: false,
+                createdAt: new Date().toISOString(),
+                createdBy: process.env.SENDER,
+                issueNumber
+              });
+              writeJson(DATA_FILE, linksData);
+              await commitAndPush(`Add shortlink: ${finalSlug}`);
+
+              await comment(`✨ **Created!**\n\nShort link: ${shortUrlOf(finalSlug)} \nTarget: ${url}`);
+              await closeIssue();
+              return;
             }
 
-            // Check duplicate slug (for reserved)
-            if (linksData.links.some(l => l.slug === finalSlug)) {
-               await github.rest.issues.createComment({
-                  owner, repo, issue_number: issueNumber,
-                  body: `❌ Slug \`${finalSlug}\` is already in use.`
-               });
-               if (!isReserved) await github.rest.issues.update({ owner, repo, issue_number: issueNumber, state: 'closed' });
-               return;
+            // ============ RESERVED ============
+            if (type === 'reserved') {
+              const previewUrl = shortUrlOf(requestedSlug);
+
+              async function createReserved(byUser, note) {
+                linksData.links.unshift({
+                  slug: requestedSlug,
+                  url,
+                  reserved: true,
+                  createdAt: new Date().toISOString(),
+                  createdBy: byUser,
+                  issueNumber
+                });
+                writeJson(DATA_FILE, linksData);
+                await commitAndPush(`Add shortlink: ${requestedSlug}`);
+                await comment(`${note}\n\nShort link created: ${shortUrlOf(requestedSlug)} \nTarget: ${url}`);
+                await closeIssue();
+              }
+
+              if (mode === 'request') {
+                if (!SLUG_RE.test(requestedSlug)) {
+                  await comment(`❌ Invalid slug \`${requestedSlug}\`. Allowed characters: letters, numbers, \`-\`, \`_\`.`);
+                  await closeIssue('not_planned');
+                  return;
+                }
+                const problem = urlProblem(url);
+                if (problem) {
+                  await comment(problem === 'banned' ? '❌ The URL domain or path is banned.' : '❌ Invalid or missing URL. Include a line like `URL: https://example.com`.');
+                  await closeIssue('not_planned');
+                  return;
+                }
+                const taken = findLink(requestedSlug);
+                if (taken) {
+                  await comment(`❌ Slug \`${requestedSlug}\` is already in use → ${taken.url}\n\nPick a different slug and open a new issue, or request a change with an \`EDIT:\` / \`DELETE:\` issue.`);
+                  await closeIssue('not_planned');
+                  return;
+                }
+                // Maintainer opened it -> auto-approve
+                if (await isAuthorized(process.env.ISSUE_AUTHOR)) {
+                  await createReserved(process.env.ISSUE_AUTHOR, '⚡ **Auto-approved** (maintainer request)');
+                  return;
+                }
+                await comment([
+                  `👋 Reserved slug request detected: [${previewUrl}](${previewUrl})`,
+                  '',
+                  'To approve this link, a maintainer can:',
+                  '- Comment **"Approved"**',
+                  '- Or close this issue as **"Close as completed"**',
+                  '',
+                  'To reject, close as **"Close as not planned"**.'
+                ].join('\n'));
+                return;
+              }
+
+              if (mode === 'approve') {
+                const alreadyDone = linksData.links.some(l => l.issueNumber === issueNumber);
+                if (!await verifyCloserAuthorized(alreadyDone)) return;
+                const problem = urlProblem(url);
+                if (problem) {
+                  await comment(problem === 'banned' ? '❌ The URL domain or path is banned.' : '❌ Invalid URL format.');
+                  await closeIssue('not_planned');
+                  return;
+                }
+                const taken = findLink(requestedSlug);
+                if (taken) {
+                  await comment(`❌ Slug \`${requestedSlug}\` is already in use → ${taken.url}`);
+                  await closeIssue('not_planned');
+                  return;
+                }
+                await createReserved(approver, `✅ **Approved** by @${approver}.`);
+                return;
+              }
+
+              if (mode === 'reject') {
+                if (linksData.links.some(l => l.issueNumber === issueNumber)) return; // already created earlier
+                await comment(`❌ **Rejected**\n\nThe reserved slug request for \`${requestedSlug}\` (${previewUrl}) has been rejected.`);
+                return;
+              }
+              return;
             }
 
-            // Create Link
-            const newLink = {
-              slug: finalSlug,
-              url: url,
-              reserved: isReserved,
-              createdAt: new Date().toISOString(),
-              createdBy: process.env.SENDER,
-              issueNumber: issueNumber
-            };
+            // ============ DELETE ============
+            if (type === 'delete') {
+              async function performDelete(byUser, note) {
+                const link = findLink(deleteSlug);
+                linksData.links = linksData.links.filter(l => l.slug !== deleteSlug);
+                writeJson(DATA_FILE, linksData);
+                await commitAndPush(`Delete shortlink: ${deleteSlug}`);
+                await comment(`${note}\n\nDeleted: ${shortUrlOf(deleteSlug)} \nTarget was: ${link.url}`);
+                await closeIssue();
+              }
 
-            linksData.links.unshift(newLink); // Add to top
-            await writeJson(DATA_FILE, linksData);
+              if (mode === 'request') {
+                const link = findLink(deleteSlug);
+                if (!link) {
+                  await comment(`❌ No shortlink found for slug \`${deleteSlug}\`.`);
+                  await closeIssue('not_planned');
+                  return;
+                }
+                if (await isAuthorized(process.env.ISSUE_AUTHOR)) {
+                  await performDelete(process.env.ISSUE_AUTHOR, '⚡ **Auto-approved** (maintainer request)');
+                  return;
+                }
+                await comment([
+                  `🗑️ Delete request detected for \`${deleteSlug}\` (${shortUrlOf(deleteSlug)} → ${link.url})`,
+                  '',
+                  'To approve this deletion, a maintainer can:',
+                  '- Comment **"Approved"**',
+                  '- Or close this issue as **"Close as completed"**',
+                  '',
+                  'To reject, close as **"Close as not planned"**.'
+                ].join('\n'));
+                return;
+              }
 
-            // Commit
-            await exec.exec('git', ['add', DATA_FILE]);
-            await exec.exec('git', ['commit', '-m', `Add shortlink: ${finalSlug}`]);
-            await exec.exec('git', ['push', 'origin', BRANCH]);
+              if (mode === 'approve') {
+                const link = findLink(deleteSlug);
+                const alreadyDone = !link; // already deleted (or never existed)
+                if (!await verifyCloserAuthorized(alreadyDone)) return;
+                await performDelete(approver, `✅ **Approved** by @${approver}.`);
+                return;
+              }
 
-            // Comment Result
-            const domainJson = fs.existsSync(DOMAIN_FILE) ? JSON.parse(fs.readFileSync(DOMAIN_FILE)) : null;
-            const domain = (domainJson && domainJson.domain) ? domainJson.domain : `${owner}.github.io/${repo}`;
-            const shortUrl = `https://${domain}/${finalSlug}`;
-            
-            const msg = isReserved 
-              ? `✅ **Approved!**\n\nShort link created: ${shortUrl} \nTarget: ${url}`
-              : `✨ **Created!**\n\nShort link: ${shortUrl} \nTarget: ${url}`;
+              if (mode === 'reject') {
+                if (!findLink(deleteSlug)) return; // already deleted earlier
+                await comment(`❌ **Rejected**\n\nThe delete request for \`${deleteSlug}\` has been rejected.`);
+                return;
+              }
+              return;
+            }
 
-            await github.rest.issues.createComment({
-              owner, repo, issue_number: issueNumber,
-              body: msg
-            });
+            // ============ EDIT ============
+            if (type === 'edit') {
+              async function performEdit(byUser, note) {
+                const link = findLink(editSlug);
+                const oldUrl = link.url;
+                link.url = url;
+                link.updatedAt = new Date().toISOString();
+                link.updatedBy = byUser;
+                writeJson(DATA_FILE, linksData);
+                await commitAndPush(`Edit shortlink: ${editSlug}`);
+                await comment(`${note}\n\nUpdated: ${shortUrlOf(editSlug)} \nOld target: ${oldUrl} \nNew target: ${url}`);
+                await closeIssue();
+              }
 
-            // Close Issue
-            await github.rest.issues.update({ owner, repo, issue_number: issueNumber, state: 'closed' });
+              if (mode === 'request') {
+                const link = findLink(editSlug);
+                if (!link) {
+                  await comment(`❌ No shortlink found for slug \`${editSlug}\`.`);
+                  await closeIssue('not_planned');
+                  return;
+                }
+                const problem = urlProblem(url);
+                if (problem) {
+                  await comment(problem === 'banned' ? '❌ The URL domain or path is banned.' : '❌ Invalid or missing URL. Include a line like `URL: https://new-target.com`.');
+                  await closeIssue('not_planned');
+                  return;
+                }
+                if (link.url === url) {
+                  await comment(`ℹ️ The shortlink \`${editSlug}\` already points to that URL.`);
+                  await closeIssue();
+                  return;
+                }
+                if (await isAuthorized(process.env.ISSUE_AUTHOR)) {
+                  await performEdit(process.env.ISSUE_AUTHOR, '⚡ **Auto-approved** (maintainer request)');
+                  return;
+                }
+                await comment([
+                  `✏️ Edit request detected for \`${editSlug}\` (${shortUrlOf(editSlug)})`,
+                  `- Current target: ${link.url}`,
+                  `- New target: ${url}`,
+                  '',
+                  'To approve this change, a maintainer can:',
+                  '- Comment **"Approved"**',
+                  '- Or close this issue as **"Close as completed"**',
+                  '',
+                  'To reject, close as **"Close as not planned"**.'
+                ].join('\n'));
+                return;
+              }
+
+              if (mode === 'approve') {
+                const link = findLink(editSlug);
+                const alreadyDone = !link || link.url === url; // deleted meanwhile or already applied
+                if (!await verifyCloserAuthorized(alreadyDone)) return;
+                const problem = urlProblem(url);
+                if (problem) {
+                  await comment(problem === 'banned' ? '❌ The URL domain or path is banned.' : '❌ Invalid URL format.');
+                  await closeIssue('not_planned');
+                  return;
+                }
+                await performEdit(approver, `✅ **Approved** by @${approver}.`);
+                return;
+              }
+
+              if (mode === 'reject') {
+                const link = findLink(editSlug);
+                if (!link || link.url === url) return; // already applied or link gone
+                await comment(`❌ **Rejected**\n\nThe edit request for \`${editSlug}\` has been rejected.`);
+                return;
+              }
+              return;
+            }
